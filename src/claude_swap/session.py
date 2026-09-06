@@ -982,7 +982,7 @@ class SessionManager:
             account_num, email, org_uuid,
         )
         session_dir, account_num, email = self.setup_session(
-            identifier, share=True, project=cwd
+            identifier, share=True, share_history=True, project=cwd
         )
         write_project_marker(session_dir, cwd, account_num, email, org_uuid)
         return session_dir, account_num, email, True

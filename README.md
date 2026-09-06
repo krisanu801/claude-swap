@@ -166,6 +166,10 @@ currently on. Selecting in the dashboard creates or re-points that profile;
 the same, and is plain `claude` anywhere without a profile. The function carries no policy
 — it only calls `cswap run --transparent`, so cswap stays the single source of truth.
 
+History is shared by default for directory profiles (`projects/` and `history.jsonl` are
+linked to `~/.claude`), so `claude --resume` in a directory lists the conversations you
+already had, whichever account they ran on; `cswap run --no-share-history` opts out.
+
 `cswap status` in a directory reports the directory's account, its profile and whether a
 session is live, before the (separate) default login. `cswap switch` on the command line
 is scoped the same way.

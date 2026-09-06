@@ -156,7 +156,7 @@ Examples:
     parser.add_argument(
         "--share-history",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,  # unset: False, except project scope → True (see below)
         help=(
             "Share conversation history (projects/ and history.jsonl) from "
             "~/.claude into the session profile, so every account sees one "
@@ -207,6 +207,13 @@ Examples:
             if session_scope(switcher.backup_dir) == "project"
             else None
         )
+        # A directory profile exists so a switch keeps the conversation going
+        # "as if nothing happened" — which has to include `--resume` listing
+        # the conversations you already had. So history is shared by default
+        # there; --no-share-history still opts out. Account profiles keep the
+        # historical opt-in.
+        if args.share_history is None:
+            args.share_history = project is not None
 
         if args.account is not None:
             manager.run(

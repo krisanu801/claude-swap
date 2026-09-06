@@ -891,3 +891,82 @@ def test_reselecting_a_stale_profile_reseeds_it(switcher, project):
     seeded = json.loads((profile / ".credentials.json").read_text())
     assert seeded == json.loads(advanced)
     assert not is_session_stale(profile)
+
+
+class TestHistoryIsSharedForDirectories:
+    """`--resume` in a directory must list the conversations you already had.
+    A profile with its own history folder is a fresh start, which is the
+    opposite of 'as if nothing happened'."""
+
+    def test_first_visit_links_history_into_the_profile(self, switcher, project):
+        from claude_swap.session import HISTORY_ITEMS
+
+        session_dir, *_ = SessionManager(switcher).set_project_account(project, "2")
+
+        for name in HISTORY_ITEMS:
+            assert (session_dir / name).is_symlink(), f"{name} must be shared"
+
+    def test_run_in_a_directory_shares_history_by_default(
+        self, switcher, project, monkeypatch
+    ):
+        from claude_swap import cli
+
+        set_setting(switcher.backup_dir, "session.scope", "project")
+        _start_profile(switcher, project, "2", "two@example.com")
+        monkeypatch.chdir(project)
+        calls = []
+
+        class FakeManager:
+            def __init__(self, sw): pass
+            def run(self, identifier, claude_args, share=True,
+                    share_history=False, require_session=False, project=None):
+                calls.append(share_history)
+
+        with patch("claude_swap.session.SessionManager", FakeManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=switcher), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["cswap", "run", "--transparent", "--"]):
+            cli.main()
+        assert calls == [True]
+
+    def test_but_no_share_history_still_opts_out(
+        self, switcher, project, monkeypatch
+    ):
+        from claude_swap import cli
+
+        set_setting(switcher.backup_dir, "session.scope", "project")
+        _start_profile(switcher, project, "2", "two@example.com")
+        monkeypatch.chdir(project)
+        calls = []
+
+        class FakeManager:
+            def __init__(self, sw): pass
+            def run(self, identifier, claude_args, share=True,
+                    share_history=False, require_session=False, project=None):
+                calls.append(share_history)
+
+        with patch("claude_swap.session.SessionManager", FakeManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=switcher), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["cswap", "run", "--no-share-history", "--"]):
+            cli.main()
+        assert calls == [False]
+
+    def test_account_profiles_keep_the_opt_in(self, switcher, project, monkeypatch):
+        from claude_swap import cli
+
+        monkeypatch.chdir(project)
+        calls = []
+
+        class FakeManager:
+            def __init__(self, sw): pass
+            def run(self, identifier, claude_args, share=True,
+                    share_history=False, require_session=False, project=None):
+                calls.append(share_history)
+
+        with patch("claude_swap.session.SessionManager", FakeManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=switcher), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["cswap", "run", "2", "--"]):
+            cli.main()
+        assert calls == [False]
