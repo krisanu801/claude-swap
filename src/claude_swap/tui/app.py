@@ -157,9 +157,36 @@ class CswapApp(App):
         snap = self.source.take(full=full, store_only=store_only)
         self.call_from_thread(self._apply_snapshot, generation, lane, snap)
 
+    def _reproject(self, snap: AccountsSnapshot) -> AccountsSnapshot:
+        """Re-point "active" at THIS DIRECTORY's account under project scope.
+
+        A snapshot's ``is_active`` means "is the default login", which a
+        project switch deliberately never moves — so without this the list
+        keeps marking the old account after a successful scoped switch, and
+        the switch looks like it did nothing. Under project scope the honest
+        answer to "which account is active *here*" is the one this
+        directory's profile holds.
+        """
+        profile = self.project_scope
+        if profile is None:
+            return snap
+        from claude_swap.session import read_project_marker
+
+        marker = read_project_marker(profile)
+        if not marker:
+            return snap
+        held = (marker.get("email"), marker.get("organizationUuid", "") or "")
+        accounts = tuple(
+            replace(acc, is_active=((acc.email, acc.org_uuid or "") == held))
+            for acc in snap.accounts
+        )
+        active = next((a.number for a in accounts if a.is_active), None)
+        return replace(snap, accounts=accounts, active_number=active)
+
     def _apply_snapshot(
         self, generation: int, lane: str, snap: AccountsSnapshot
     ) -> None:
+        snap = self._reproject(snap)
         if lane == "normal":
             self._normal_refreshing = False
             self._normal_started_at = None

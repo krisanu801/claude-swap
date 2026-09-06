@@ -377,3 +377,95 @@ class TestDashboardRouting:
         _start_profile(switcher, project, "1", "one@example.com")
         monkeypatch.chdir(project)
         assert self._app(switcher).project_scope is None
+
+
+class TestScopedDisplay:
+    """A scoped switch that the display contradicts reads as a failed switch.
+
+    The snapshot's ``is_active`` means "is the default login" — which a
+    project switch never moves. Left alone, the list keeps marking the old
+    account after a successful switch, which is precisely how this feature
+    looks broken while working.
+    """
+
+    def _app(self, switcher):
+        from claude_swap.tui.app import CswapApp
+
+        return CswapApp(switcher)
+
+    def _snapshot(self, active: str):
+        from claude_swap.models import AccountSnapshot, AccountsSnapshot, UsageEntry
+
+        accounts = tuple(
+            AccountSnapshot(
+                number=num,
+                email=email,
+                org_name="Org",
+                org_uuid=ORG,
+                is_active=(num == active),
+                kind="oauth",
+                switchable=True,
+                usage=UsageEntry(),
+            )
+            for num, email in (("1", "one@example.com"), ("2", "two@example.com"))
+        )
+        return AccountsSnapshot(
+            active_number=active, accounts=accounts, taken_at=0.0
+        )
+
+    def test_active_follows_the_project_not_the_default_login(
+        self, switcher, project, monkeypatch
+    ):
+        set_setting(switcher.backup_dir, "session.scope", "project")
+        _start_profile(switcher, project, "2", "two@example.com")
+        monkeypatch.chdir(project)
+
+        # The default login is still account 1; the project holds account 2.
+        reprojected = self._app(switcher)._reproject(self._snapshot("1"))
+
+        assert reprojected.active_number == "2", (
+            "the list must mark the account this directory holds"
+        )
+        assert [a.number for a in reprojected.accounts if a.is_active] == ["2"]
+
+    def test_untouched_without_project_scope(self, switcher, project, monkeypatch):
+        _start_profile(switcher, project, "2", "two@example.com")
+        monkeypatch.chdir(project)
+        snap = self._snapshot("1")
+        assert self._app(switcher)._reproject(snap) is snap
+
+
+def test_marker_reads_from_a_string_path(tmp_path: Path):
+    """The signature accepts str; a TypeError here is a crash, not a None."""
+    write_project_marker(tmp_path, tmp_path, "1", "a@example.com", "org")
+    assert read_project_marker(str(tmp_path))["email"] == "a@example.com"
+
+
+class TestStatusReportsTheDirectory:
+    """`status` is the verification command; under project scope it must
+    answer "which account is THIS directory on", not "what is the default
+    login" — the two differ by design, and only one of them is the question."""
+
+    def test_names_the_directory_and_its_account(
+        self, switcher, project, monkeypatch, capsys
+    ):
+        set_setting(switcher.backup_dir, "session.scope", "project")
+        _start_profile(switcher, project, "2", "two@example.com")
+        monkeypatch.chdir(project)
+
+        switcher.status()
+        out = capsys.readouterr().out
+
+        assert "This directory:" in out
+        assert "potra" in out
+        assert "two@example.com" in out
+
+    def test_silent_without_project_scope(
+        self, switcher, project, monkeypatch, capsys
+    ):
+        _start_profile(switcher, project, "2", "two@example.com")
+        monkeypatch.chdir(project)
+
+        switcher.status()
+
+        assert "This directory:" not in capsys.readouterr().out

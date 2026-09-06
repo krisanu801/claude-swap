@@ -259,11 +259,11 @@ def project_session_dir(backup_dir: Path, path: str | Path) -> Path:
     return backup_dir / "sessions" / f"proj-{project_slug(path)}"
 
 
-def read_project_marker(session_dir: Path) -> dict | None:
+def read_project_marker(session_dir: str | Path) -> dict | None:
     """Read a project profile's marker, or None if absent/corrupt."""
     try:
         data = json.loads(
-            (session_dir / PROJECT_MARKER).read_text(encoding="utf-8")
+            (Path(session_dir) / PROJECT_MARKER).read_text(encoding="utf-8")
         )
     except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return None

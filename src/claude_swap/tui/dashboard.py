@@ -17,15 +17,19 @@ No global command palette: actions live where their context is.
 
 from __future__ import annotations
 
+import os
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import Footer, ListView, Static
 
 from claude_swap.models import AccountsSnapshot
+from claude_swap.tui.theme import Palette
 from claude_swap.tui.widgets import AccountItem, AccountsPanel, MenuItem
 
 if TYPE_CHECKING:
@@ -59,14 +63,36 @@ class DashboardScreen(Screen):
         self._menu_stack: list[tuple[str, MenuEntries]] = []
 
     def compose(self) -> ComposeResult:
+        yield Static("", id="scope-banner")
         yield AccountsPanel(id="accounts-panel")
         yield Static("", id="menu-title")
         yield ListView(id="menu")
         yield Footer()
 
     async def on_mount(self) -> None:
+        self._show_scope()
         self.query_one("#menu", ListView).focus()
         await self._push_menu("menu", self._root_entries())
+
+    def _show_scope(self) -> None:
+        """Say which directory a switch will move, when it is not the machine.
+
+        Without this the dashboard looks identical in both modes while doing
+        two very different things — and a scoped switch that says nothing
+        about its scope is indistinguishable from one that failed.
+        """
+        banner = self.query_one("#scope-banner", Static)
+        profile = self.app.project_scope
+        if profile is None:
+            banner.display = False
+            return
+        banner.update(
+            Text(
+                f"project scope · switches move {Path(os.getcwd()).name} only",
+                style=f"bold {Palette.from_theme(self.app.current_theme).accent}",
+            )
+        )
+        banner.display = True
 
     # -- menu plumbing --------------------------------------------------------
 

@@ -5648,6 +5648,8 @@ class ClaudeAccountSwitcher:
         if json_output:
             return self._build_status_payload()
 
+        self._print_project_status()
+
         identity = self._get_current_account()
         if identity is None:
             print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
@@ -5680,6 +5682,47 @@ class ClaudeAccountSwitcher:
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
         return None
+
+    def _print_project_status(self) -> None:
+        """Report THIS DIRECTORY's account first, when project scope applies.
+
+        Without this, ``status`` answers a question the user did not ask under
+        project scope: it names the default login, which a project switch
+        never moves — so a correctly scoped directory looks like it is on the
+        wrong account. The directory's own answer has to come first, and the
+        default login has to be labelled as the separate thing it is.
+        """
+        import os
+
+        from claude_swap.session import (
+            project_scope_dir,
+            read_project_marker,
+            scan_live_sessions,
+        )
+
+        try:
+            profile = project_scope_dir(self.backup_dir, os.getcwd())
+        except Exception:  # noqa: BLE001 - status must never fail on scope
+            return
+        if profile is None:
+            return
+        marker = read_project_marker(profile) or {}
+        email = marker.get("email") or "unknown"
+        num = marker.get("accountNum") or "?"
+        where = Path(marker.get("path") or os.getcwd()).name
+        live, _ = scan_live_sessions(profile)
+        state = (
+            f"{len(live)} live session{'s' if len(live) != 1 else ''}"
+            if live
+            else "no live session"
+        )
+        print(
+            f"{bolded('This directory:')} {accent(where)} → "
+            f"{accent(f'Account-{num}')} ({email}) {muted(f'[{state}]')}"
+        )
+        print(f"  {dimmed(f'profile: {profile}')}")
+        print(f"  {dimmed('a switch run here moves this directory only')}")
+        print()
 
     def _first_run_setup(self) -> None:
         """First-run setup workflow."""
