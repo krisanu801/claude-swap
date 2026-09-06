@@ -137,39 +137,45 @@ A session refreshes its own copy of the account's token, so once it exits, the c
 ### Per-project accounts (`session.scope = project`)
 
 By default a switch is machine-wide: `cswap switch` moves the default login, and every
-terminal on it follows. Opt into project scope and a switch moves **only the directory you
-run it from**:
+terminal on it follows. Project scope makes `cswap` mean **"the account for this
+directory"** instead — so two directories can run two accounts (or the same one) side by
+side, and switching one never touches the other. Two one-time steps:
 
 ```bash
 cswap config set session.scope project
+echo 'eval "$(cswap shell-init zsh)"' >> ~/.zshrc     # bash: shell-init bash; fish: | source
 ```
 
-With it on, `cswap run` keys the session profile by **directory** rather than by account,
-and a switch re-points that one profile:
+Then, in each directory, in its own terminal:
 
 ```bash
-cd ~/work/api    && cswap run 2   # once per terminal
-cd ~/work/webapp && cswap run 1   # once per terminal
-
-cd ~/work/api && cswap            # dashboard → pick an account
-# api moves to that account; webapp and the default login do not move
+cd ~/work/api && cswap        # pick an account → api is on it; the dashboard stays open
+claude                        # (another tab, same directory) starts on api's account
 ```
 
-The switch is **live, not a relaunch**. Only the credentials inside that directory's
-profile are rewritten, so the `claude` already running there picks the new account up the
-way it picks up any credential change — on the next message on Linux/Windows, once the
-~30s Keychain cache expires on macOS — and the conversation continues. `cswap switch`
-with no argument rotates that directory to the next account; a switch from a subdirectory
-governs the project it sits in.
+The dashboard is the switcher: pick a different account there and the Claude running in
+that directory moves to it **live** — the conversation continues (Linux/Windows on the
+next message, macOS once the ~30s Keychain cache expires). Do the same in `~/work/webapp`
+with any account; changing one directory never moves the other, and neither moves the
+default login.
 
-Because the profile is keyed by the directory, it keeps one chat history across every
-account the directory is later switched onto.
+How it works: with project scope on, a session profile is keyed by **directory**
+(`<backup>/sessions/proj-<name>-<hash>/`) and holds whichever account that directory is
+currently on. Selecting in the dashboard creates or re-points that profile;
+`cswap run` with no account launches into it; the shell function makes bare `claude` do
+the same, and is plain `claude` anywhere without a profile. The function carries no policy
+— it only calls `cswap run --transparent`, so cswap stays the single source of truth.
+
+`cswap status` in a directory reports the directory's account, its profile and whether a
+session is live, before the (separate) default login. `cswap switch` on the command line
+is scoped the same way.
 
 Two caveats worth knowing:
 
-- A directory has to have been launched with `cswap run` at least once — that is what
-  binds the terminal to its own profile, and a live process's `CLAUDE_CONFIG_DIR` cannot
-  be changed afterwards. Without it there is nothing to scope, and the switch stays global.
+- The shell function is the one thing that cannot live inside cswap: which store a Claude
+  process reads is fixed by `CLAUDE_CONFIG_DIR` at launch, Claude does not read it from
+  project settings, and the `claude` binary is a symlink its own installer owns. A Claude
+  started without it is on the default login.
 - Pointing two *live* directories at the same account is not free: each refreshes its own
   copy of the token, and a rotated refresh token invalidates the other's. cswap warns when
   you do it.

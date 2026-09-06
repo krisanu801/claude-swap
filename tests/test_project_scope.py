@@ -151,6 +151,47 @@ def _config(email: str) -> str:
     )
 
 
+@pytest.fixture(autouse=True)
+def no_real_claude_or_network(monkeypatch):
+    """Nothing in this module wants the real `claude` or the token endpoint.
+
+    Profile setup probes `claude auth status --json` against the new profile
+    and refreshes the account's token first; both are faked here so a test
+    exercises the routing, not this machine's login state or the network.
+    The probe answers from what the profile actually holds.
+    """
+    from types import SimpleNamespace
+
+    from claude_swap import session as session_mod
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    def fake_probe(cmd, env=None, **kwargs):
+        config_dir = Path(env["CLAUDE_CONFIG_DIR"])
+        try:
+            acct = json.loads((config_dir / ".claude.json").read_text())["oauthAccount"]
+        except (OSError, KeyError, ValueError):
+            acct = None
+        if acct and (config_dir / ".credentials.json").exists():
+            payload = {
+                "loggedIn": True,
+                "authMethod": "claude.ai",
+                "email": acct["emailAddress"],
+                "orgId": acct["organizationUuid"],
+            }
+        else:
+            payload = {"loggedIn": False, "authMethod": "none"}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(session_mod.subprocess, "run", fake_probe)
+    monkeypatch.setattr(
+        ClaudeAccountSwitcher,
+        "consume_backup_grant",
+        lambda self, num, email, creds: SimpleNamespace(
+            error=None, credentials=None, stashed=False
+        ),
+    )
+
+
 @pytest.fixture
 def macos_platform(monkeypatch):
     from claude_swap.models import Platform
@@ -471,30 +512,131 @@ class TestStatusReportsTheDirectory:
         assert "This directory:" not in capsys.readouterr().out
 
 
-class TestDashboardLaunchesWhenNothingIsRunning:
-    """`cswap` alone must be enough.
+# ── select = set this directory's account; `claude` = start on it ─────────
+class TestSetProjectAccount:
+    def test_first_visit_creates_the_profile(self, switcher, project):
+        session_dir, num, email, created = SessionManager(
+            switcher
+        ).set_project_account(project, "2")
 
-    Selecting an account in a directory with no live session used to fall
-    through to the machine-wide switch (when no profile existed) or re-point a
-    profile nothing was running under — both of which look, from the terminal,
-    exactly like nothing happened. The dashboard has to launch instead.
-    """
+        assert created is True
+        assert session_dir == project_session_dir(switcher.backup_dir, project)
+        assert (num, email) == ("2", "two@example.com")
+        assert read_project_marker(session_dir)["email"] == "two@example.com"
+        assert (session_dir / ".credentials.json").is_file()
 
+    def test_later_visits_repoint_without_recreating(self, switcher, project):
+        manager = SessionManager(switcher)
+        first, *_ = manager.set_project_account(project, "1")
+        second, num, _, created = manager.set_project_account(project, "2")
+
+        assert created is False
+        assert second == first, "the profile must not move between accounts"
+        assert num == "2"
+
+    def test_never_touches_the_default_login(self, switcher, project):
+        before = switcher._get_current_account()
+        SessionManager(switcher).set_project_account(project, "2")
+        assert switcher._get_current_account() == before
+
+
+class TestRunResolvesTheDirectorysAccount:
+    """`cswap run` with no account — what the `claude` shell function calls —
+    must land on the account the dashboard set for this directory."""
+
+    def _run(self, argv, monkeypatch, calls, switcher):
+        from claude_swap import cli
+
+        class FakeManager:
+            def __init__(self, sw):
+                pass
+
+            def run(self, identifier, claude_args, share=True,
+                    share_history=False, require_session=False, project=None):
+                calls.append(("run", identifier, claude_args, project))
+
+            def exec_default(self, claude_args):
+                calls.append(("exec_default", claude_args))
+
+        with patch("claude_swap.session.SessionManager", FakeManager), \
+             patch("claude_swap.cli.ClaudeAccountSwitcher", return_value=switcher), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["cswap", "run", *argv]):
+            cli.main()
+
+    def test_lands_on_the_projects_account(self, switcher, project, monkeypatch):
+        set_setting(switcher.backup_dir, "session.scope", "project")
+        _start_profile(switcher, project, "2", "two@example.com")
+        monkeypatch.chdir(project)
+        calls = []
+
+        self._run(["--transparent", "--", "--resume"], monkeypatch, calls, switcher)
+
+        assert calls == [("run", "2", ["--resume"], str(project))]
+
+    def test_a_subdirectory_lands_on_the_same_profile(
+        self, switcher, project, monkeypatch
+    ):
+        set_setting(switcher.backup_dir, "session.scope", "project")
+        _start_profile(switcher, project, "2", "two@example.com")
+        deep = project / "src"
+        deep.mkdir()
+        monkeypatch.chdir(deep)
+        calls = []
+
+        self._run(["--transparent", "--"], monkeypatch, calls, switcher)
+
+        assert calls[0][3] == str(project), "must resolve to the root's profile"
+
+    def test_transparent_outside_any_project_is_plain_claude(
+        self, switcher, project, monkeypatch, capsys
+    ):
+        set_setting(switcher.backup_dir, "session.scope", "project")
+        monkeypatch.chdir(project)
+        calls = []
+
+        self._run(["--transparent", "--", "--version"], monkeypatch, calls, switcher)
+
+        assert calls == [("exec_default", ["--version"])]
+        assert "No account mapped" not in capsys.readouterr().out, (
+            "a bare `claude` outside a project must not chatter"
+        )
+
+
+class TestShellInit:
+    def _out(self, shell, capsys):
+        from claude_swap import cli
+
+        with patch.object(sys, "argv", ["cswap", "shell-init", shell]):
+            cli.main()
+        return capsys.readouterr().out
+
+    def test_zsh_defers_entirely_to_cswap_run(self, capsys, temp_home):
+        out = self._out("zsh", capsys)
+        assert "claude() {" in out
+        assert "cswap run --transparent -- \"$@\"" in out
+        assert 'command claude "$@"' in out, "must degrade to plain claude"
+
+    def test_fish_has_the_same_shape(self, capsys, temp_home):
+        out = self._out("fish", capsys)
+        assert "function claude" in out
+        assert "cswap run --transparent -- $argv" in out
+
+    def test_the_function_carries_no_policy(self, capsys, temp_home):
+        """Every routing decision belongs to cswap, so the shell function
+        must not know about scopes, profiles, or CLAUDE_CONFIG_DIR."""
+        out = self._out("zsh", capsys)
+        for word in ("CLAUDE_CONFIG_DIR", "sessions/", "proj-", ".json"):
+            assert word not in out
+
+
+class TestDashboardSelectSetsTheDirectory:
     def _app(self, switcher):
         from claude_swap.tui.app import CswapApp
 
         return CswapApp(switcher)
 
-    def test_scope_is_project_without_any_profile(
-        self, switcher, project, monkeypatch
-    ):
-        set_setting(switcher.backup_dir, "session.scope", "project")
-        monkeypatch.chdir(project)
-        app = self._app(switcher)
-        assert app.scope_is_project is True
-        assert app.project_scope is None, "nothing to re-point on a first visit"
-
-    def test_first_visit_queues_a_launch_instead_of_a_global_switch(
+    def test_first_visit_sets_rather_than_switching_globally(
         self, switcher, project, monkeypatch
     ):
         set_setting(switcher.backup_dir, "session.scope", "project")
@@ -502,104 +644,42 @@ class TestDashboardLaunchesWhenNothingIsRunning:
         app = self._app(switcher)
 
         with patch.object(type(switcher), "switch_to") as global_switch, \
-             patch.object(type(app), "exit") as exit_, \
              patch.object(type(app), "_start_action") as start_action:
             app.do_switch("2")
 
         global_switch.assert_not_called()
-        start_action.assert_not_called()
-        assert app.pending_launch == ("2", str(project))
-        exit_.assert_called_once()
-
-    def test_confirming_queues_the_launch_and_exits(
-        self, switcher, project, monkeypatch
-    ):
-        set_setting(switcher.backup_dir, "session.scope", "project")
-        monkeypatch.chdir(project)
-        app = self._app(switcher)
-
-        with patch.object(type(app), "exit") as exit_:
-            app._queue_launch(str(project), "2")
-
-        assert app.pending_launch == ("2", str(project))
-        exit_.assert_called_once()
-
-    def test_a_quiescent_profile_launches_rather_than_repointing(
-        self, switcher, project, monkeypatch
-    ):
-        """Re-pointing a profile nothing runs under would look like a no-op."""
-        set_setting(switcher.backup_dir, "session.scope", "project")
-        _start_profile(switcher, project, "1", "one@example.com")
-        monkeypatch.chdir(project)
-        app = self._app(switcher)
-
-        with patch.object(type(app), "exit") as exit_, \
-             patch.object(type(app), "_start_action") as start_action:
-            app.do_switch("2")
-
-        start_action.assert_not_called()
-        assert app.pending_launch == ("2", str(project))
-        exit_.assert_called_once()
-
-    def test_a_live_profile_repoints_in_place(
-        self, switcher, project, monkeypatch
-    ):
-        """The live case is the feature: switch under the running session."""
-        set_setting(switcher.backup_dir, "session.scope", "project")
-        _start_profile(switcher, project, "1", "one@example.com")
-        monkeypatch.chdir(project)
-        app = self._app(switcher)
-
-        with patch("claude_swap.session.profile_is_quiescent", return_value=False), \
-             patch.object(type(app), "exit") as exit_, \
-             patch.object(type(app), "_start_action") as start_action:
-            app.do_switch("2")
-
-        exit_.assert_not_called()
-        assert app.pending_launch is None
         start_action.assert_called_once()
+        assert start_action.call_args[0][0].startswith("Set potra to account 2")
+
+    def test_payload_says_to_run_claude_when_nothing_runs(
+        self, switcher, project
+    ):
+        from claude_swap.tui.app import CswapApp
+
+        payload = CswapApp._set_project_payload(
+            SessionManager(switcher), str(project), "2"
+        )
+        assert payload["scope"] == "project"
+        assert payload["created"] is True
+        assert "run `claude` in potra" in payload["message"]
+
+    def test_payload_says_the_session_follows_when_one_runs(
+        self, switcher, project
+    ):
+        from claude_swap.tui.app import CswapApp
+
+        _start_profile(switcher, project, "1", "one@example.com")
+        with patch("claude_swap.session.profile_is_quiescent", return_value=False):
+            payload = CswapApp._set_project_payload(
+                SessionManager(switcher), str(project), "2"
+            )
+        assert "running session follows" in payload["message"]
 
     def test_scope_off_still_switches_the_default_login(
         self, switcher, project, monkeypatch
     ):
         monkeypatch.chdir(project)
         app = self._app(switcher)
-
-        with patch.object(type(app), "_start_action") as start_action, \
-             patch.object(type(app), "exit") as exit_:
+        with patch.object(type(app), "_start_action") as start_action:
             app.do_switch("2")
-
-        exit_.assert_not_called()
-        start_action.assert_called_once()
         assert "Switch to account 2" in start_action.call_args[0][0]
-
-
-def test_tui_run_performs_a_queued_launch(switcher, project, monkeypatch):
-    """The exec cannot happen inside Textual; run() must do it on the way out."""
-    from claude_swap import tui
-
-    calls = []
-
-    class FakeApp:
-        return_code = 0
-        pending_launch = ("2", str(project))
-
-        def __init__(self, *a, **k):
-            pass
-
-        def run(self):
-            calls.append("app.run")
-
-    class FakeManager:
-        def __init__(self, sw):
-            pass
-
-        def run(self, number, args, project=None):
-            calls.append(("launch", number, project))
-
-    monkeypatch.setattr("claude_swap.tui.app.CswapApp", FakeApp)
-    monkeypatch.setattr("claude_swap.session.SessionManager", FakeManager)
-
-    tui.run(switcher)
-
-    assert calls == ["app.run", ("launch", "2", str(project))]

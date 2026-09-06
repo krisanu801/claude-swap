@@ -85,19 +85,20 @@ class DashboardScreen(Screen):
         if not self.app.scope_is_project:
             banner.display = False
             return
-        from claude_swap.session import profile_is_quiescent
+        from claude_swap.session import profile_is_quiescent, read_project_marker
 
         here = Path(os.getcwd()).name
         profile = self.app.project_scope
-        live = profile is not None and not profile_is_quiescent(profile)
-        # Selecting an account does one of two things depending on whether a
-        # Claude is running here, and the difference is worth stating: one
-        # continues a conversation, the other starts one.
-        what = (
-            f"switching moves {here} only — this conversation continues"
-            if live
-            else f"nothing is running in {here} — selecting an account starts Claude here"
-        )
+        # Three states the person needs to tell apart at a glance: this
+        # directory has no account yet, has one but nothing is running on it,
+        # or has a session that a switch here will move.
+        if profile is None:
+            what = f"{here} has no account yet — select one, then run `claude` here"
+        elif profile_is_quiescent(profile):
+            held = (read_project_marker(profile) or {}).get("accountNum", "?")
+            what = f"{here} → Account-{held} · run `claude` here to start on it"
+        else:
+            what = f"switching moves {here} only — the running session follows"
         banner.update(
             Text(
                 f"project scope · {what}",

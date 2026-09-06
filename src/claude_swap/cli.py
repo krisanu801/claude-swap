@@ -175,6 +175,15 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--transparent",
+        action="store_true",
+        help=(
+            "Behave exactly like plain `claude` when nothing routes this "
+            "directory to an account: no message, just launch. Used by the "
+            "shell integration (`cswap shell-init`)"
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -210,7 +219,27 @@ Examples:
             )
             return  # only reachable in tests where exec/exit is mocked
 
-        # No account given: resolve from the current directory's mapping.
+        # No account given. Under project scope the directory's own profile
+        # is the authority — it is what the dashboard sets and what a switch
+        # re-points — so a session started here lands on it. This is the
+        # launch half of "switch this project, not this computer".
+        if project is not None:
+            from claude_swap.session import project_account_for
+
+            resolved = project_account_for(switcher.backup_dir, os.getcwd())
+            if resolved is not None:
+                num, path, _ = resolved
+                manager.run(
+                    num,
+                    tail,
+                    share=not args.no_share,
+                    share_history=args.share_history,
+                    require_session=args.require_session,
+                    project=path,
+                )
+                return  # only reachable in tests
+
+        # Then the current directory's mapping.
         slot, email = switcher.slot_for_directory(os.getcwd())
         if slot is not None:
             manager.run(
@@ -227,7 +256,7 @@ Examples:
                 f"Mapped account {email} no longer exists — "
                 "launching the default account."
             )
-        else:
+        elif not args.transparent:
             print(
                 dimmed(
                     f"No account mapped for {os.getcwd()} — "
@@ -295,6 +324,61 @@ def _scoped_switch(
                 "expires (~30s) — no restart, the conversation continues."
             )
         )
+
+
+_SHELL_INIT = {
+    "zsh": """\
+# cswap shell integration: in a project-scoped directory, `claude` starts on
+# that directory's account (`cswap`, pick one). Elsewhere it is plain claude.
+claude() {
+  if command -v cswap >/dev/null 2>&1; then
+    command cswap run --transparent -- "$@"
+  else
+    command claude "$@"
+  fi
+}
+""",
+    "fish": """\
+# cswap shell integration: in a project-scoped directory, `claude` starts on
+# that directory's account (`cswap`, pick one). Elsewhere it is plain claude.
+function claude
+    if command -q cswap
+        command cswap run --transparent -- $argv
+    else
+        command claude $argv
+    end
+end
+""",
+}
+_SHELL_INIT["bash"] = _SHELL_INIT["zsh"]
+
+
+def _shell_init_command(argv: list[str]) -> None:
+    """Print the `claude` shell function for `eval "$(cswap shell-init zsh)"`.
+
+    This is the one piece that cannot live inside cswap: which credential
+    store a Claude process reads is fixed by ``CLAUDE_CONFIG_DIR`` at launch,
+    Claude does not consult project settings for it (verified), and the
+    ``claude`` binary is a symlink its own installer owns. So for a bare
+    ``claude`` typed in a directory to land on that directory's account,
+    something on the way in has to route it — and the smallest such thing is
+    a shell function that defers entirely to ``cswap run``. cswap stays the
+    single source of truth; the function carries no policy of its own.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} shell-init",
+        description=(
+            "Print shell code that makes `claude` start on the current "
+            "directory's account under project scope. Add to your rc file:\n"
+            '  eval "$(cswap shell-init zsh)"     # ~/.zshrc\n'
+            '  eval "$(cswap shell-init bash)"    # ~/.bashrc\n'
+            "  cswap shell-init fish | source     # ~/.config/fish/config.fish"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("shell", choices=sorted(_SHELL_INIT))
+    args = parser.parse_args(argv)
+    print(_SHELL_INIT[args.shell], end="")
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -1054,6 +1138,9 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
+    if argv and argv[0] == "shell-init":
+        _shell_init_command(argv[1:])
+        return
     if argv and argv[0] == "map":
         _map_command(argv[1:])
         return
@@ -1102,6 +1189,7 @@ Commands:
   %(prog)s enable <num|email>         return a disabled account to rotation
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
+  %(prog)s shell-init <shell>          `claude` uses the dir's account (eval in rc)
   %(prog)s map <num|email> [path]     map a directory to an account
   %(prog)s map                        list directory mappings
   %(prog)s unmap [path]               remove a directory mapping

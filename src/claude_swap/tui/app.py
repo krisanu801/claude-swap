@@ -72,10 +72,6 @@ class CswapApp(App):
         self._refresh_generation = 0
         self._applied_generation = 0
         self._last_refresh_error = ""
-        # Set when the user picks an account for a directory with no live
-        # session: Textual owns the terminal, so the exec has to happen after
-        # app.run() returns. (account number, directory).
-        self.pending_launch: tuple[str, str] | None = None
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
         try:
@@ -359,17 +355,15 @@ class CswapApp(App):
     def do_switch(self, number: str) -> None:
         """Switch — scoped to this directory when project scope is on.
 
-        Three cases, and the difference between them is whether a Claude is
-        already running under this directory's profile:
+        Under project scope, selecting an account SETS this directory's
+        account and nothing more: the profile is created on a first visit or
+        re-pointed after that, and the dashboard stays open as the switcher.
+        A session already running here follows the re-point live; a
+        ``claude`` started here afterwards picks the profile up. The
+        dashboard never launches — a dashboard that turns into Claude cannot
+        also be the side-by-side window you switch from.
 
-        - A live session here: re-point the profile in place. The running
-          claude picks the new credentials up and the conversation continues,
-          which is the whole point of the feature.
-        - No live session (or no profile yet): there is nothing to re-point
-          under, so the honest thing is to LAUNCH one — otherwise selecting an
-          account in a fresh terminal would appear to do nothing at all. The
-          launch is confirmed, then handed to the CLI once the TUI exits.
-        - Scope off: the historical machine-wide switch.
+        Scope off: the historical machine-wide switch.
         """
         if not self.scope_is_project:
             self._start_action(
@@ -378,41 +372,40 @@ class CswapApp(App):
             )
             return
 
-        from claude_swap.session import SessionManager, profile_is_quiescent
+        from claude_swap.session import SessionManager
 
         cwd = os.getcwd()
-        profile = self.project_scope
-        if profile is not None and not profile_is_quiescent(profile):
-            manager = SessionManager(self.switcher)
-            self._start_action(
-                f"Switch {Path(cwd).name} to account {number}",
-                partial(self._scoped_switch_payload, manager, cwd, number),
-            )
-            return
-        self._queue_launch(cwd, number)
+        manager = SessionManager(self.switcher)
+        self._start_action(
+            f"Set {Path(cwd).name} to account {number}",
+            partial(self._set_project_payload, manager, cwd, number),
+        )
 
-    def _account_label(self, number: str) -> str:
-        snap = self.snapshot
-        for acc in snap.accounts if snap else ():
-            if acc.number == number:
-                return f"Account-{number} ({acc.email})"
-        return f"Account-{number}"
+    @staticmethod
+    def _set_project_payload(manager, cwd: str, number: str) -> dict:
+        """Adapt ``set_project_account`` to the payload shape actions expect.
 
-    def _queue_launch(self, cwd: str, number: str) -> None:
-        """Leave the TUI and hand the terminal a Claude on that account.
-
-        No confirmation step: selecting an account IS the instruction, and a
-        confirmation here proved worse than useless — pushed from inside the
-        switch list's own selection handler, mid screen-stack unwind, its
-        dismiss callback is queued on a message pump that is already closed,
-        so the modal confirms and calls nothing. Selecting then appears to do
-        nothing at all, which is the exact failure this path exists to fix.
-
-        The banner on the dashboard says this will happen, so it is announced
-        rather than surprising.
+        The message names what happens next, because the two outcomes look
+        identical in the list and mean different things to the person:
+        a running session is already moving, or one still has to be started.
         """
-        self.pending_launch = (number, cwd)
-        self.exit()
+        from claude_swap.session import profile_is_quiescent
+
+        session_dir, num, email, created = manager.set_project_account(cwd, number)
+        here = Path(cwd).name
+        if profile_is_quiescent(session_dir):
+            hint = f"run `claude` in {here} to start a session on it"
+        else:
+            hint = "the running session follows (macOS: within ~30s)"
+        return {
+            "scope": "project",
+            "project": str(Path(cwd).resolve()),
+            "profile": str(session_dir),
+            "accountNum": num,
+            "email": email,
+            "created": created,
+            "message": f"{here} → Account-{num} ({email}) · {hint}",
+        }
 
     @staticmethod
     def _scoped_switch_payload(manager, cwd: str, number: str) -> dict:

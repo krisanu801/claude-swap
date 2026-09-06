@@ -599,6 +599,29 @@ def session_scope(backup_dir: Path) -> str:
         return "account"
 
 
+def project_account_for(
+    backup_dir: Path, cwd: str | Path
+) -> tuple[str, str, str] | None:
+    """(account number, directory path, profile dir) governing ``cwd``, or None.
+
+    The launch-side counterpart to :func:`project_scope_dir`: ``cswap run``
+    with no account, and the ``claude`` shell integration, ask this to find
+    out which account a session started here should use. The directory path
+    returned is the PROFILE's (an ancestor, when the profile was made at the
+    repo root and the launch is from a subdirectory), so the launch resolves
+    to the same profile the switch does.
+    """
+    profile = project_scope_dir(backup_dir, cwd)
+    if profile is None:
+        return None
+    marker = read_project_marker(profile) or {}
+    num = str(marker.get("accountNum") or "")
+    path = marker.get("path") or normalize_path(cwd)
+    if not num:
+        return None
+    return num, path, str(profile)
+
+
 def project_scope_dir(backup_dir: Path, cwd: str | Path) -> Path | None:
     """The project profile a switch from ``cwd`` should re-point, or None.
 
@@ -813,6 +836,35 @@ class SessionManager:
             session_dir, project_path, account_num, email, org_uuid
         )
         return session_dir, account_num, email
+
+    def set_project_account(
+        self, cwd: str | Path, identifier: str
+    ) -> tuple[Path, str, str, bool]:
+        """Make ``identifier`` the account for ``cwd``'s directory — creating
+        the profile if this is the directory's first visit, re-pointing it if
+        not. Returns (profile dir, account number, email, created).
+
+        This is what selecting an account in the dashboard means under project
+        scope. It never launches anything: the dashboard stays open as the
+        switcher, and a ``claude`` started in this directory afterwards picks
+        the profile up (``cswap run`` resolves it; the shell integration makes
+        bare ``claude`` do the same). If a session is already running here, the
+        re-point reaches it live.
+        """
+        if find_project_profile(self.switcher.backup_dir, cwd) is not None:
+            session_dir, num, email = self.switch_project(cwd, identifier)
+            return session_dir, num, email, False
+
+        account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        self._ensure_not_api_key(account_num, email)
+        self._warn_on_duplicate_holder(
+            project_session_dir(self.switcher.backup_dir, cwd), email, org_uuid
+        )
+        session_dir, account_num, email = self.setup_session(
+            identifier, share=True, project=cwd
+        )
+        write_project_marker(session_dir, cwd, account_num, email, org_uuid)
+        return session_dir, account_num, email, True
 
     def rotate_project(self, cwd: str | Path) -> tuple[Path, str, str]:
         """Scoped counterpart to a bare ``cswap switch``: next account, this dir.
