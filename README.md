@@ -134,6 +134,46 @@ Running the account that is already your default login launches plain `claude` o
   
 A session refreshes its own copy of the account's token, so once it exits, the credential it rotated is captured back into the account's stored backup before a switch or usage check uses that backup. While a session is still running, `cswap switch` refuses to move the default login onto its account if the stored backup has already fallen behind (activating it could only fail); exit the session first, or pick another account.
 
+### Per-project accounts (`session.scope = project`)
+
+By default a switch is machine-wide: `cswap switch` moves the default login, and every
+terminal on it follows. Opt into project scope and a switch moves **only the directory you
+run it from**:
+
+```bash
+cswap config set session.scope project
+```
+
+With it on, `cswap run` keys the session profile by **directory** rather than by account,
+and a switch re-points that one profile:
+
+```bash
+cd ~/work/api    && cswap run 2   # once per terminal
+cd ~/work/webapp && cswap run 1   # once per terminal
+
+cd ~/work/api && cswap            # dashboard → pick an account
+# api moves to that account; webapp and the default login do not move
+```
+
+The switch is **live, not a relaunch**. Only the credentials inside that directory's
+profile are rewritten, so the `claude` already running there picks the new account up the
+way it picks up any credential change — on the next message on Linux/Windows, once the
+~30s Keychain cache expires on macOS — and the conversation continues. `cswap switch`
+with no argument rotates that directory to the next account; a switch from a subdirectory
+governs the project it sits in.
+
+Because the profile is keyed by the directory, it keeps one chat history across every
+account the directory is later switched onto.
+
+Two caveats worth knowing:
+
+- A directory has to have been launched with `cswap run` at least once — that is what
+  binds the terminal to its own profile, and a live process's `CLAUDE_CONFIG_DIR` cannot
+  be changed afterwards. Without it there is nothing to scope, and the switch stays global.
+- Pointing two *live* directories at the same account is not free: each refreshes its own
+  copy of the token, and a rotated refresh token invalidates the other's. cswap warns when
+  you do it.
+
 <details>
 <summary>Sharing details — MCP servers & chat history</summary>
 

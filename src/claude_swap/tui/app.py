@@ -8,8 +8,10 @@ loop never touches file locks, keychain subprocesses, or the network.
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import replace
+from pathlib import Path
 from functools import partial
 
 from textual.app import App
@@ -267,6 +269,14 @@ class CswapApp(App):
             self.push_screen(OutputModal(f"{label} — failed", result.output))
             return
         payload = result.payload or {}
+        if payload.get("scope") == "project":
+            # A scoped switch has no default-login "switched" flag to report;
+            # name the directory that moved so the blast radius is visible.
+            self.notify(
+                str(payload.get("message") or "switched"),
+                title="Switch (this project only)",
+            )
+            return
         if "switched" in payload:
             if payload.get("switched"):
                 to = payload.get("to") or {}
@@ -283,11 +293,56 @@ class CswapApp(App):
 
     # -- account operations ----------------------------------------------------
 
+    @property
+    def project_scope(self) -> Path | None:
+        """The project profile governing the directory cswap was started in.
+
+        None means switches from this dashboard move the default login, as
+        they always have. Read live rather than cached at startup so a
+        profile created in another terminal is picked up without a restart.
+        """
+        from claude_swap.session import project_scope_dir
+
+        try:
+            return project_scope_dir(self.switcher.backup_dir, os.getcwd())
+        except OSError:
+            return None
+
     def do_switch(self, number: str) -> None:
+        """Switch — scoped to this directory when a project profile governs it.
+
+        The scoped path re-points only this directory's profile, so the claude
+        running here moves to the new account and every other terminal stays
+        where it is. Without a project profile this is the historical
+        default-login switch.
+        """
+        if self.project_scope is not None:
+            from claude_swap.session import SessionManager
+
+            cwd = os.getcwd()
+            manager = SessionManager(self.switcher)
+            self._start_action(
+                f"Switch {Path(cwd).name} to account {number}",
+                partial(self._scoped_switch_payload, manager, cwd, number),
+            )
+            return
         self._start_action(
             f"Switch to account {number}",
             partial(self.switcher.switch_to, number, json_output=True),
         )
+
+    @staticmethod
+    def _scoped_switch_payload(manager, cwd: str, number: str) -> dict:
+        """Adapt ``switch_project`` to the JSON payload shape actions expect."""
+        session_dir, num, email = manager.switch_project(cwd, number)
+        return {
+            "scope": "project",
+            "project": str(Path(cwd).resolve()),
+            "profile": str(session_dir),
+            "accountNum": num,
+            "email": email,
+            "message": f"{Path(cwd).name} → Account-{num} ({email})",
+        }
 
     def action_switch_best(self) -> None:
         self._start_action(

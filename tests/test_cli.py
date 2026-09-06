@@ -713,6 +713,7 @@ class TestRunCommand:
                 share=True,
                 share_history=False,
                 require_session=False,
+                project=None,
             ):
                 calls.append((
                     "run", identifier, claude_args, share, share_history,
@@ -804,6 +805,7 @@ class TestRunCommand:
                 share=True,
                 share_history=False,
                 require_session=False,
+                project=None,
             ):
                 from claude_swap.exceptions import SessionError
 
@@ -913,6 +915,7 @@ class TestSubcommandAliases:
                 share=True,
                 share_history=False,
                 require_session=False,
+                project=None,
             ):
                 calls.append((identifier, claude_args, share))
 
@@ -1510,6 +1513,7 @@ class TestRunAutoResolve:
                 share=True,
                 share_history=False,
                 require_session=False,
+                project=None,
             ):
                 calls.append(("run", identifier, claude_args, share, share_history))
 

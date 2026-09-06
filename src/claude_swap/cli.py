@@ -6,10 +6,12 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
+from claude_swap.models import Platform
 from claude_swap.printer import (
     accent,
     bolded,
@@ -187,6 +189,16 @@ Examples:
 
         manager = SessionManager(switcher)
 
+        # session.scope=project keys the profile by directory instead of by
+        # account, which is what makes a later switch scoped to this terminal.
+        from claude_swap.session import session_scope
+
+        project = (
+            os.getcwd()
+            if session_scope(switcher.backup_dir) == "project"
+            else None
+        )
+
         if args.account is not None:
             manager.run(
                 args.account,
@@ -194,6 +206,7 @@ Examples:
                 share=not args.no_share,
                 share_history=args.share_history,
                 require_session=args.require_session,
+                project=project,
             )
             return  # only reachable in tests where exec/exit is mocked
 
@@ -206,6 +219,7 @@ Examples:
                 share=not args.no_share,
                 share_history=args.share_history,
                 require_session=args.require_session,
+                project=project,
             )
             return  # only reachable in tests
         if email is not None:
@@ -227,6 +241,60 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _scoped_switch(
+    switcher: ClaudeAccountSwitcher,
+    cwd: str,
+    target: str | None,
+    json_output: bool = False,
+) -> None:
+    """Switch the account for ONE directory, leaving the default login alone.
+
+    ``target`` None rotates to the next account, mirroring a bare
+    ``cswap switch``. The running claude in that directory is not restarted:
+    it re-reads the profile's credentials on its own, so the conversation
+    continues on the new account.
+    """
+    import json as _json
+
+    from claude_swap.session import SessionManager
+
+    manager = SessionManager(switcher)
+    if target is None:
+        session_dir, num, email = manager.rotate_project(cwd)
+    else:
+        session_dir, num, email = manager.switch_project(cwd, target)
+
+    project = Path(cwd).name
+    if json_output:
+        print(
+            _json.dumps(
+                {
+                    "scope": "project",
+                    "project": str(Path(cwd).resolve()),
+                    "profile": str(session_dir),
+                    "accountNum": num,
+                    "email": email,
+                },
+                indent=2,
+            )
+        )
+        return
+    print(f"{accent(project)} → Account-{num} ({email})")
+    print(
+        dimmed(
+            "Only this directory moved; the default login and other "
+            "terminals are untouched."
+        )
+    )
+    if switcher.platform == Platform.MACOS:
+        print(
+            dimmed(
+                "A running claude here picks this up once its Keychain cache "
+                "expires (~30s) — no restart, the conversation continues."
+            )
+        )
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -1389,6 +1457,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 json_output=args.json,
             )
         elif args.switch:
+            from claude_swap.session import project_scope_dir
+
+            if project_scope_dir(switcher.backup_dir, os.getcwd()) is not None:
+                _scoped_switch(switcher, os.getcwd(), None, args.json)
+                return
             from claude_swap.settings import load_settings, parse_model_names
 
             # Only the usage-aware strategies read model limits: --model wins;
@@ -1411,6 +1484,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 payload["models"] = list(models)
                 payload["modelSource"] = model_source
         elif args.switch_to:
+            from claude_swap.session import project_scope_dir
+
+            if project_scope_dir(switcher.backup_dir, os.getcwd()) is not None:
+                _scoped_switch(switcher, os.getcwd(), args.switch_to, args.json)
+                return
             payload = switcher.switch_to(
                 args.switch_to, json_output=args.json, force=args.force
             )

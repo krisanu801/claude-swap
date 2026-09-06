@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -57,11 +58,14 @@ from claude_swap.exceptions import (
 )
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.locking import FileLock
-from claude_swap.models import Platform
+from claude_swap.mappings import normalize_path
+from claude_swap.models import Platform, get_timestamp
 from claude_swap.paths import get_default_global_config_path
 from claude_swap.printer import accent, dimmed, muted, warning
 from claude_swap.process_detection import ClaudeSession, scan_sessions
 from claude_swap.settings import atomic_write_json
+
+logger = logging.getLogger("claude-swap")
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -217,6 +221,95 @@ def slugify_email(email: str) -> str:
         ch if (ch.isascii() and (ch.isalnum() or ch in "._-")) else "_"
         for ch in normalized
     )
+
+
+# ── project-scoped profiles ─────────────────────────────────────────────────
+#
+# An account-keyed profile (``sessions/2-user_x.com``) answers "where do this
+# ACCOUNT's credentials live". That is the wrong key for per-directory
+# switching: moving a directory onto a different account would mean moving its
+# running claude to a different profile, and a live process's
+# ``CLAUDE_CONFIG_DIR`` cannot change. So a project profile is keyed by the
+# DIRECTORY and holds whichever account that directory is currently on —
+# re-pointing it is a credential rewrite in place, which a running claude
+# picks up on its own (Linux/Windows: file watch; macOS: Keychain cache
+# expiry, ~30s).
+PROJECT_MARKER = "cswap-project.json"
+
+_PROJECT_SLUG_SAFE = "abcdefghijklmnopqrstuvwxyz0123456789-_"
+
+
+def project_slug(path: str | Path) -> str:
+    """Stable, filesystem-safe profile name for a directory.
+
+    ``<basename>-<8 hex of the normalized path>``: the basename keeps the
+    directory listing readable, the hash keeps two same-named directories
+    (``~/a/api`` and ``~/b/api``) apart. Built on ``normalize_path`` so the
+    key does not depend on how the path was typed.
+    """
+    key = normalize_path(path)
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+    base = unicodedata.normalize("NFKD", Path(key).name).lower()
+    base = "".join(c if c in _PROJECT_SLUG_SAFE else "-" for c in base).strip("-")
+    return f"{base[:32] or 'dir'}-{digest}"
+
+
+def project_session_dir(backup_dir: Path, path: str | Path) -> Path:
+    """Profile directory for ``path`` under ``<backup>/sessions/proj-…``."""
+    return backup_dir / "sessions" / f"proj-{project_slug(path)}"
+
+
+def read_project_marker(session_dir: Path) -> dict | None:
+    """Read a project profile's marker, or None if absent/corrupt."""
+    try:
+        data = json.loads(
+            (session_dir / PROJECT_MARKER).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_project_marker(
+    session_dir: Path, path: str | Path, account_num: str, email: str, org_uuid: str
+) -> None:
+    """Record which directory this profile serves and the account it holds.
+
+    Advisory only — the credentials in the profile are the truth. The marker
+    exists so ``cswap`` can name the directory and the account in its output
+    without re-deriving them, and so a stray profile is identifiable.
+    """
+    payload = {
+        "schemaVersion": 1,
+        "path": normalize_path(path),
+        "accountNum": account_num,
+        "email": email,
+        "organizationUuid": org_uuid or "",
+        "updated": get_timestamp(),
+    }
+    marker = session_dir / PROJECT_MARKER
+    try:
+        session_dir.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(marker, 0o600)
+    except OSError:
+        logger.warning("could not write project marker at %s", marker)
+
+
+def find_project_profile(backup_dir: Path, cwd: str | Path) -> Path | None:
+    """Existing project profile for ``cwd`` or its nearest mapped ancestor.
+
+    Walks cwd upward so a session started at the repo root still governs a
+    switch run from a subdirectory — the same "most specific wins" rule
+    ``MappingStore.resolve`` uses, but over profiles that actually exist.
+    """
+    current = Path(normalize_path(cwd))
+    for candidate in (current, *current.parents):
+        session_dir = project_session_dir(backup_dir, candidate)
+        if (session_dir / PROJECT_MARKER).exists():
+            return session_dir
+    return None
 
 
 def session_dir_for(backup_dir: Path, account_num: str, email: str) -> Path:
@@ -491,6 +584,40 @@ def _probe_env(session_dir: Path) -> dict[str, str]:
     return env
 
 
+def session_scope(backup_dir: Path) -> str:
+    """``session.scope`` for this install, degrading to "account" on any fault.
+
+    Scope is a preference, not an invariant: a settings file that cannot be
+    read should launch the historical way, not refuse to launch.
+    """
+    from claude_swap.settings import load_session_settings
+
+    try:
+        return load_session_settings(backup_dir).scope
+    except (OSError, TypeError, ValueError):
+        logger.debug("session scope read failed", exc_info=True)
+        return "account"
+
+
+def project_scope_dir(backup_dir: Path, cwd: str | Path) -> Path | None:
+    """The project profile a switch from ``cwd`` should re-point, or None.
+
+    None means "no project profile governs this directory", and the caller
+    should fall back to the global default-login switch — the historical
+    behaviour, and still the right one for a terminal that was not launched
+    into a project profile.
+    """
+    if session_scope(backup_dir) != "project":
+        return None
+    try:
+        return find_project_profile(backup_dir, cwd)
+    except (OSError, TypeError, ValueError):
+        # Scope detection must never be what breaks a switch: fall back to
+        # the global path, which is what an unconfigured install does anyway.
+        logger.debug("project scope detection failed", exc_info=True)
+        return None
+
+
 class SessionManager:
     """Bootstraps per-account session profiles and launches Claude into them."""
 
@@ -508,6 +635,7 @@ class SessionManager:
         share: bool = True,
         share_history: bool = False,
         require_session: bool = False,
+        project: str | Path | None = None,
     ) -> NoReturn:
         """Launch Claude Code as the given account in the current terminal.
 
@@ -516,6 +644,12 @@ class SessionManager:
         terminal to one account per session needs the isolation guaranteed,
         and a session on the default login is the one thing an account
         switch can later pull out from under it.
+
+        ``project`` launches into that directory's own profile instead of the
+        account's. It implies the isolation ``require_session`` asks for and
+        takes the fast path off the table entirely: the whole point of a
+        project profile is that a later switch moves THIS directory and
+        nothing else, which a session sharing the default login cannot give.
         """
         claude_bin = shutil.which("claude")
         if not claude_bin:
@@ -535,7 +669,15 @@ class SessionManager:
         self._ensure_not_api_key(account_num, email)
 
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
-        if config_dir_preset:
+        if project is not None:
+            # A project profile is never the default login's, so "is this
+            # already the active account" cannot make the launch redundant.
+            if config_dir_preset:
+                warning(
+                    f"CLAUDE_CONFIG_DIR is already set ({config_dir_preset}); "
+                    "overriding it for this launch."
+                )
+        elif config_dir_preset:
             # With CLAUDE_CONFIG_DIR set, "current default account" is
             # meaningless (we may already be inside a session terminal), so
             # the same-account fast path below must not trigger.
@@ -575,18 +717,170 @@ class SessionManager:
             )
 
         session_dir, account_num, email = self.setup_session(
-            identifier, share, share_history
+            identifier, share, share_history, project=project
         )
+        if project is not None:
+            _, _, org_uuid = self.switcher.resolve_account(identifier)
+            write_project_marker(
+                session_dir, project, account_num, email, org_uuid
+            )
 
+        scope_label = (
+            f"[project: {Path(normalize_path(project)).name}]"
+            if project is not None
+            else "[session mode]"
+        )
         print(
             f"{accent('Launching')} Account-{account_num} ({email}) "
-            f"{muted('[session mode]')}"
+            f"{muted(scope_label)}"
         )
         env = {
             k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS
         }
         env["CLAUDE_CONFIG_DIR"] = str(session_dir)
         self._exec(claude_bin, claude_args, env=env)
+
+    def switch_project(
+        self, cwd: str | Path, identifier: str
+    ) -> tuple[Path, str, str]:
+        """Re-point ONE directory's profile at another account, live.
+
+        This is the scoped counterpart to a default-login switch: it rewrites
+        the credentials inside that directory's profile and leaves
+        ``~/.claude`` — and therefore every other terminal — untouched. The
+        claude already running in that directory is not restarted; it picks
+        the new credentials up the way it picks up any credential change
+        (Linux/Windows on the next message, macOS once the ~30s Keychain
+        cache expires), so the conversation continues on the new account.
+
+        Returns (profile dir, account number, email). Raises ``SessionError``
+        if the directory has no profile yet — there is nothing to re-point,
+        and silently creating one here would leave the running claude on its
+        old account while claiming a switch had happened.
+        """
+        session_dir = find_project_profile(self.switcher.backup_dir, cwd)
+        if session_dir is None:
+            raise SessionError(
+                f"No project profile for {normalize_path(cwd)}. Start one with "
+                f"`cswap run <account>` in this directory first; a switch can "
+                f"only re-point a profile that a session is already using."
+            )
+
+        account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        self._ensure_not_api_key(account_num, email)
+
+        marker = read_project_marker(session_dir) or {}
+        project_path = marker.get("path") or normalize_path(cwd)
+
+        if (marker.get("email"), marker.get("organizationUuid", "")) == (
+            email,
+            org_uuid or "",
+        ) and _artifacts_say_usable(session_dir, email, org_uuid):
+            # Already there. Say so rather than spending a refresh grant and
+            # rewriting a credential the running claude is happily using.
+            #
+            # Local artifacts only, deliberately: the fuller check shells out
+            # to `claude auth status`, and a probe that cannot answer would
+            # turn "you are already on this account" into a needless rewrite
+            # under a live session — the one thing this path exists to avoid.
+            return session_dir, account_num, email
+
+        self._warn_on_duplicate_holder(session_dir, email, org_uuid)
+
+        # Same ordering as a launch: refresh outside the lock (it POSTs),
+        # then seed under it. See setup_session for why the two cannot swap.
+        pre_creds = self.switcher.read_account_credentials(account_num, email)
+        if pre_creds and self._has_refresh_token(pre_creds):
+            outcome = self.switcher.consume_backup_grant(
+                account_num, email, pre_creds
+            )
+            if outcome.error is not None and outcome.credentials:
+                raise SessionError(
+                    f"Account-{account_num}'s refreshed credential could not "
+                    f"be stored, so the backup holds a spent grant. "
+                    f"{'Retry — the successor is stashed.' if outcome.stashed else 'Fix the storage failure before retrying.'}"
+                )
+            if outcome.error is not None:
+                warning(
+                    f"Could not refresh the token for Account-{account_num}; "
+                    "continuing with the stored credentials."
+                )
+
+        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+            self._bootstrap(session_dir, account_num, email, org_uuid)
+            clear_session_stale(session_dir)
+        write_project_marker(
+            session_dir, project_path, account_num, email, org_uuid
+        )
+        return session_dir, account_num, email
+
+    def rotate_project(self, cwd: str | Path) -> tuple[Path, str, str]:
+        """Scoped counterpart to a bare ``cswap switch``: next account, this dir.
+
+        Rotation order is the same sequence the global switch uses, minus
+        disabled slots, starting after whatever the profile holds now.
+        """
+        session_dir = find_project_profile(self.switcher.backup_dir, cwd)
+        if session_dir is None:
+            raise SessionError(
+                f"No project profile for {normalize_path(cwd)}. Start one with "
+                f"`cswap run <account>` in this directory first."
+            )
+        data = self.switcher._get_sequence_data() or {}
+        order = [
+            str(num)
+            for num in data.get("sequence", [])
+            if not self.switcher._disabled_from_data(data, str(num))
+        ]
+        if not order:
+            raise SessionError("No accounts available to rotate to.")
+
+        marker = read_project_marker(session_dir) or {}
+        current = str(marker.get("accountNum") or "")
+        try:
+            nxt = order[(order.index(current) + 1) % len(order)]
+        except ValueError:
+            nxt = order[0]
+        if nxt == current and len(order) == 1:
+            raise SessionError(
+                "Only one account is available, and this directory is "
+                "already on it."
+            )
+        return self.switch_project(cwd, nxt)
+
+    def _warn_on_duplicate_holder(
+        self, session_dir: Path, email: str, org_uuid: str
+    ) -> None:
+        """Warn when another LIVE profile already holds this account.
+
+        Two profiles holding one account each refresh their own copy, and a
+        rotated refresh token invalidates the other's — so the second one to
+        refresh gets logged out. Quiescent profiles are harmless (nothing is
+        refreshing), so only live ones are worth interrupting for.
+        """
+        sessions_root = self.switcher.backup_dir / "sessions"
+        if not sessions_root.is_dir():
+            return
+        for other in sorted(sessions_root.iterdir()):
+            if not other.is_dir() or other == session_dir:
+                continue
+            identity = read_session_identity(other)
+            if identity != (email, org_uuid or ""):
+                continue
+            if profile_is_quiescent(other):
+                continue
+            marker = read_project_marker(other)
+            who = (
+                f"the project profile for {marker['path']}"
+                if marker and marker.get("path")
+                else f"profile {other.name}"
+            )
+            warning(
+                f"{email} is already live in {who}. Two live copies of one "
+                f"account can log each other out when either refreshes its "
+                f"token — prefer a different account for this directory."
+            )
+            return
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.
@@ -639,13 +933,27 @@ class SessionManager:
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(
-        self, identifier: str, share: bool, share_history: bool = False
+        self,
+        identifier: str,
+        share: bool,
+        share_history: bool = False,
+        project: str | Path | None = None,
     ) -> tuple[Path, str, str]:
-        """Ensure a valid session profile exists; returns (dir, num, email)."""
+        """Ensure a valid session profile exists; returns (dir, num, email).
+
+        With ``project`` the profile is keyed by that directory rather than by
+        the account, so the same directory keeps one profile (and one history)
+        across every account it is later switched onto.
+        """
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         # Defense-in-depth: also guard here (run() guards before its fast path).
         self._ensure_not_api_key(account_num, email)
-        session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
+        if project is not None:
+            session_dir = project_session_dir(self.switcher.backup_dir, project)
+        else:
+            session_dir = session_dir_for(
+                self.switcher.backup_dir, account_num, email
+            )
 
         # Deferred invalidation: backup credentials changed while this profile
         # was live, so its credentials are presumed stale even if they still
