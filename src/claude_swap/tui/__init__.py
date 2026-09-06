@@ -40,4 +40,20 @@ def run(switcher: "ClaudeAccountSwitcher", start: str = "dashboard") -> int:
     except Exception:
         pass
     app.run()
+
+    # The dashboard cannot exec while Textual owns the terminal, so a launch
+    # chosen in the UI is queued and performed here, once the driver has given
+    # the terminal back. SessionManager.run() execs and never returns.
+    launch = getattr(app, "pending_launch", None)
+    if launch is not None:
+        from claude_swap.exceptions import ClaudeSwitchError
+        from claude_swap.printer import error
+        from claude_swap.session import SessionManager
+
+        number, cwd = launch
+        try:
+            SessionManager(switcher).run(number, [], project=cwd)
+        except ClaudeSwitchError as e:
+            error(f"Error: {e}")
+            return 1
     return app.return_code or 0

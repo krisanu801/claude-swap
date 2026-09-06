@@ -82,13 +82,25 @@ class DashboardScreen(Screen):
         about its scope is indistinguishable from one that failed.
         """
         banner = self.query_one("#scope-banner", Static)
-        profile = self.app.project_scope
-        if profile is None:
+        if not self.app.scope_is_project:
             banner.display = False
             return
+        from claude_swap.session import profile_is_quiescent
+
+        here = Path(os.getcwd()).name
+        profile = self.app.project_scope
+        live = profile is not None and not profile_is_quiescent(profile)
+        # Selecting an account does one of two things depending on whether a
+        # Claude is running here, and the difference is worth stating: one
+        # continues a conversation, the other starts one.
+        what = (
+            f"switching moves {here} only — this conversation continues"
+            if live
+            else f"nothing is running in {here} — selecting an account starts Claude here"
+        )
         banner.update(
             Text(
-                f"project scope · switches move {Path(os.getcwd()).name} only",
+                f"project scope · {what}",
                 style=f"bold {Palette.from_theme(self.app.current_theme).accent}",
             )
         )
@@ -343,8 +355,11 @@ class SwitchScreen(AccountListScreen):
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         item = event.item
         if isinstance(item, AccountItem):
-            self.app.do_switch(item.number)
+            # Leave this screen BEFORE switching: do_switch may push a
+            # confirmation, and popping afterwards would dismiss that modal
+            # instead of this list — the switch would then silently do nothing.
             self.app.pop_screen()
+            self.app.do_switch(item.number)
 
     def action_select_highlighted(self) -> None:
         listview = self.query_one("#accounts", ListView)

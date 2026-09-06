@@ -72,6 +72,10 @@ class CswapApp(App):
         self._refresh_generation = 0
         self._applied_generation = 0
         self._last_refresh_error = ""
+        # Set when the user picks an account for a directory with no live
+        # session: Textual owns the terminal, so the exec has to happen after
+        # app.run() returns. (account number, directory).
+        self.pending_launch: tuple[str, str] | None = None
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
         try:
@@ -321,6 +325,23 @@ class CswapApp(App):
     # -- account operations ----------------------------------------------------
 
     @property
+    def scope_is_project(self) -> bool:
+        """Whether ``session.scope = project`` is configured.
+
+        Distinct from :attr:`project_scope`, which additionally requires the
+        profile to already EXIST. The difference is the first visit to a
+        directory: scope is on, but there is nothing to re-point yet, and
+        selecting an account there has to create the profile rather than fall
+        back to moving the machine-wide default login.
+        """
+        from claude_swap.session import session_scope
+
+        try:
+            return session_scope(self.switcher.backup_dir) == "project"
+        except OSError:
+            return False
+
+    @property
     def project_scope(self) -> Path | None:
         """The project profile governing the directory cswap was started in.
 
@@ -336,27 +357,62 @@ class CswapApp(App):
             return None
 
     def do_switch(self, number: str) -> None:
-        """Switch — scoped to this directory when a project profile governs it.
+        """Switch — scoped to this directory when project scope is on.
 
-        The scoped path re-points only this directory's profile, so the claude
-        running here moves to the new account and every other terminal stays
-        where it is. Without a project profile this is the historical
-        default-login switch.
+        Three cases, and the difference between them is whether a Claude is
+        already running under this directory's profile:
+
+        - A live session here: re-point the profile in place. The running
+          claude picks the new credentials up and the conversation continues,
+          which is the whole point of the feature.
+        - No live session (or no profile yet): there is nothing to re-point
+          under, so the honest thing is to LAUNCH one — otherwise selecting an
+          account in a fresh terminal would appear to do nothing at all. The
+          launch is confirmed, then handed to the CLI once the TUI exits.
+        - Scope off: the historical machine-wide switch.
         """
-        if self.project_scope is not None:
-            from claude_swap.session import SessionManager
+        if not self.scope_is_project:
+            self._start_action(
+                f"Switch to account {number}",
+                partial(self.switcher.switch_to, number, json_output=True),
+            )
+            return
 
-            cwd = os.getcwd()
+        from claude_swap.session import SessionManager, profile_is_quiescent
+
+        cwd = os.getcwd()
+        profile = self.project_scope
+        if profile is not None and not profile_is_quiescent(profile):
             manager = SessionManager(self.switcher)
             self._start_action(
                 f"Switch {Path(cwd).name} to account {number}",
                 partial(self._scoped_switch_payload, manager, cwd, number),
             )
             return
-        self._start_action(
-            f"Switch to account {number}",
-            partial(self.switcher.switch_to, number, json_output=True),
-        )
+        self._queue_launch(cwd, number)
+
+    def _account_label(self, number: str) -> str:
+        snap = self.snapshot
+        for acc in snap.accounts if snap else ():
+            if acc.number == number:
+                return f"Account-{number} ({acc.email})"
+        return f"Account-{number}"
+
+    def _queue_launch(self, cwd: str, number: str) -> None:
+        """Leave the TUI and hand the terminal a Claude on that account.
+
+        No confirmation step: selecting an account IS the instruction, and a
+        confirmation here proved worse than useless — pushed from inside the
+        switch list's own selection handler, mid screen-stack unwind, its
+        dismiss callback is queued on a message pump that is already closed,
+        so the modal confirms and calls nothing. Selecting then appears to do
+        nothing at all, which is the exact failure this path exists to fix.
+
+        The banner on the dashboard says this will happen, so it is announced
+        rather than surprising.
+        """
+        self.pending_launch = (number, cwd)
+        self.exit()
 
     @staticmethod
     def _scoped_switch_payload(manager, cwd: str, number: str) -> dict:

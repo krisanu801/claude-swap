@@ -469,3 +469,137 @@ class TestStatusReportsTheDirectory:
         switcher.status()
 
         assert "This directory:" not in capsys.readouterr().out
+
+
+class TestDashboardLaunchesWhenNothingIsRunning:
+    """`cswap` alone must be enough.
+
+    Selecting an account in a directory with no live session used to fall
+    through to the machine-wide switch (when no profile existed) or re-point a
+    profile nothing was running under — both of which look, from the terminal,
+    exactly like nothing happened. The dashboard has to launch instead.
+    """
+
+    def _app(self, switcher):
+        from claude_swap.tui.app import CswapApp
+
+        return CswapApp(switcher)
+
+    def test_scope_is_project_without_any_profile(
+        self, switcher, project, monkeypatch
+    ):
+        set_setting(switcher.backup_dir, "session.scope", "project")
+        monkeypatch.chdir(project)
+        app = self._app(switcher)
+        assert app.scope_is_project is True
+        assert app.project_scope is None, "nothing to re-point on a first visit"
+
+    def test_first_visit_queues_a_launch_instead_of_a_global_switch(
+        self, switcher, project, monkeypatch
+    ):
+        set_setting(switcher.backup_dir, "session.scope", "project")
+        monkeypatch.chdir(project)
+        app = self._app(switcher)
+
+        with patch.object(type(switcher), "switch_to") as global_switch, \
+             patch.object(type(app), "exit") as exit_, \
+             patch.object(type(app), "_start_action") as start_action:
+            app.do_switch("2")
+
+        global_switch.assert_not_called()
+        start_action.assert_not_called()
+        assert app.pending_launch == ("2", str(project))
+        exit_.assert_called_once()
+
+    def test_confirming_queues_the_launch_and_exits(
+        self, switcher, project, monkeypatch
+    ):
+        set_setting(switcher.backup_dir, "session.scope", "project")
+        monkeypatch.chdir(project)
+        app = self._app(switcher)
+
+        with patch.object(type(app), "exit") as exit_:
+            app._queue_launch(str(project), "2")
+
+        assert app.pending_launch == ("2", str(project))
+        exit_.assert_called_once()
+
+    def test_a_quiescent_profile_launches_rather_than_repointing(
+        self, switcher, project, monkeypatch
+    ):
+        """Re-pointing a profile nothing runs under would look like a no-op."""
+        set_setting(switcher.backup_dir, "session.scope", "project")
+        _start_profile(switcher, project, "1", "one@example.com")
+        monkeypatch.chdir(project)
+        app = self._app(switcher)
+
+        with patch.object(type(app), "exit") as exit_, \
+             patch.object(type(app), "_start_action") as start_action:
+            app.do_switch("2")
+
+        start_action.assert_not_called()
+        assert app.pending_launch == ("2", str(project))
+        exit_.assert_called_once()
+
+    def test_a_live_profile_repoints_in_place(
+        self, switcher, project, monkeypatch
+    ):
+        """The live case is the feature: switch under the running session."""
+        set_setting(switcher.backup_dir, "session.scope", "project")
+        _start_profile(switcher, project, "1", "one@example.com")
+        monkeypatch.chdir(project)
+        app = self._app(switcher)
+
+        with patch("claude_swap.session.profile_is_quiescent", return_value=False), \
+             patch.object(type(app), "exit") as exit_, \
+             patch.object(type(app), "_start_action") as start_action:
+            app.do_switch("2")
+
+        exit_.assert_not_called()
+        assert app.pending_launch is None
+        start_action.assert_called_once()
+
+    def test_scope_off_still_switches_the_default_login(
+        self, switcher, project, monkeypatch
+    ):
+        monkeypatch.chdir(project)
+        app = self._app(switcher)
+
+        with patch.object(type(app), "_start_action") as start_action, \
+             patch.object(type(app), "exit") as exit_:
+            app.do_switch("2")
+
+        exit_.assert_not_called()
+        start_action.assert_called_once()
+        assert "Switch to account 2" in start_action.call_args[0][0]
+
+
+def test_tui_run_performs_a_queued_launch(switcher, project, monkeypatch):
+    """The exec cannot happen inside Textual; run() must do it on the way out."""
+    from claude_swap import tui
+
+    calls = []
+
+    class FakeApp:
+        return_code = 0
+        pending_launch = ("2", str(project))
+
+        def __init__(self, *a, **k):
+            pass
+
+        def run(self):
+            calls.append("app.run")
+
+    class FakeManager:
+        def __init__(self, sw):
+            pass
+
+        def run(self, number, args, project=None):
+            calls.append(("launch", number, project))
+
+    monkeypatch.setattr("claude_swap.tui.app.CswapApp", FakeApp)
+    monkeypatch.setattr("claude_swap.session.SessionManager", FakeManager)
+
+    tui.run(switcher)
+
+    assert calls == ["app.run", ("launch", "2", str(project))]
