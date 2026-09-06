@@ -622,6 +622,45 @@ def project_account_for(
     return num, path, str(profile)
 
 
+def profiles_holding(
+    backup_dir: Path, account_num: str, email: str, org_uuid: str
+) -> list[Path]:
+    """Every session profile that holds this account: its account-keyed dir
+    plus each ``proj-*`` dir whose marker names the same identity.
+
+    Every path that keeps a profile and its backup in step — capture the
+    profile's rotated generation into the backup, invalidate or stale-mark
+    the profile when the backup moves — used to look ONLY at the
+    account-keyed dir. A project profile holding the account was invisible
+    to all of them, which is how a switch destroyed the account's newest
+    refresh token and the next switch back seeded the spent one.
+    """
+    found = [session_dir_for(backup_dir, account_num, email)]
+    root = backup_dir / "sessions"
+    if not root.is_dir():
+        return found
+    try:
+        candidates = sorted(root.iterdir())
+    except OSError:
+        return found
+    for d in candidates:
+        if not d.name.startswith("proj-") or not d.is_dir():
+            continue
+        marker = read_project_marker(d) or {}
+        if (marker.get("email"), marker.get("organizationUuid", "") or "") == (
+            email,
+            org_uuid or "",
+        ):
+            found.append(d)
+    return found
+
+
+def live_session_cwds(session_dir: Path) -> list[str]:
+    """Working directories of Claude instances live under one profile."""
+    sessions, _ = scan_live_sessions(session_dir)
+    return sorted({s.cwd for s in sessions if s.cwd})
+
+
 def project_scope_dir(backup_dir: Path, cwd: str | Path) -> Path | None:
     """The project profile a switch from ``cwd`` should re-point, or None.
 
@@ -795,10 +834,12 @@ class SessionManager:
         marker = read_project_marker(session_dir) or {}
         project_path = marker.get("path") or normalize_path(cwd)
 
-        if (marker.get("email"), marker.get("organizationUuid", "")) == (
-            email,
-            org_uuid or "",
-        ) and _artifacts_say_usable(session_dir, email, org_uuid):
+        if (
+            (marker.get("email"), marker.get("organizationUuid", ""))
+            == (email, org_uuid or "")
+            and not is_session_stale(session_dir)
+            and _artifacts_say_usable(session_dir, email, org_uuid)
+        ):
             # Already there. Say so rather than spending a refresh grant and
             # rewriting a credential the running claude is happily using.
             #
@@ -808,7 +849,7 @@ class SessionManager:
             # under a live session — the one thing this path exists to avoid.
             return session_dir, account_num, email
 
-        self._warn_on_duplicate_holder(session_dir, email, org_uuid)
+        self._refuse_if_live_elsewhere(session_dir, account_num, email, org_uuid)
 
         # Same ordering as a launch: refresh outside the lock (it POSTs),
         # then seed under it. See setup_session for why the two cannot swap.
@@ -830,12 +871,91 @@ class SessionManager:
                 )
 
         with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+            # Capture BEFORE destroy. _bootstrap deletes the profile's
+            # keychain entry, and after any session that refreshed, that
+            # entry holds the outgoing account's newest generation — the
+            # backup has the spent predecessor. Deleting first is how "switch
+            # away, then back" logged the account out.
+            self._capture_outgoing(session_dir, marker)
             self._bootstrap(session_dir, account_num, email, org_uuid)
             clear_session_stale(session_dir)
         write_project_marker(
             session_dir, project_path, account_num, email, org_uuid
         )
         return session_dir, account_num, email
+
+    def _capture_outgoing(self, session_dir: Path, marker: dict) -> None:
+        """Advance the outgoing account's backup to the profile's generation.
+
+        Caller holds the lock. Only when the profile is a NEWER generation of
+        the same family (``_session_profile_ahead``): a re-login elsewhere, a
+        stale-flagged profile or a foreign identity all answer None there and
+        are left alone. Pure store write, as ``_adopt_session_credential``
+        does: the invalidating writer would stale-mark the very profile that
+        is about to be re-seeded anyway.
+        """
+        num = str(marker.get("accountNum") or "")
+        email = marker.get("email") or ""
+        org = marker.get("organizationUuid", "") or ""
+        if not num or not email:
+            return
+        try:
+            ahead = self.switcher._session_profile_ahead(
+                num, email, org, session_dir=session_dir
+            )
+            if ahead is None:
+                return
+            self.switcher._store._write_account_credentials(num, email, ahead)
+        except (OSError, CredentialReadError):
+            logger.warning(
+                "could not capture account %s's rotated credential from %s "
+                "before re-pointing it; its backup may be behind",
+                num, session_dir, exc_info=True,
+            )
+            return
+        logger.info(
+            "Captured account %s's rotated credential from %s into its backup",
+            num, session_dir,
+        )
+
+    def _refuse_if_live_elsewhere(
+        self, session_dir: Path, account_num: str, email: str, org_uuid: str
+    ) -> None:
+        """One account, one live place.
+
+        A profile is seeded with a COPY of the account's refresh token. Two
+        live copies each rotate the family, and a rotation invalidates the
+        other copy's token — whichever refreshes second is logged out, with
+        nothing to show for it until then. cswap already refuses a session
+        for the active default login on exactly this ground; project scope
+        sidestepped that guard, and this reinstates it across every place
+        an account can be live: another project profile, the account-keyed
+        profile, or the default login.
+        """
+        where: list[str] = []
+        for other in profiles_holding(
+            self.switcher.backup_dir, account_num, email, org_uuid
+        ):
+            if other == session_dir:
+                continue
+            cwds = live_session_cwds(other)
+            if cwds:
+                where.extend(cwds)
+        current = self.switcher._get_current_account()
+        if current is not None and current == (email, org_uuid or ""):
+            default_dir = get_default_global_config_path().parent
+            cwds = live_session_cwds(default_dir)
+            if cwds:
+                where.extend(f"{c} (default login)" for c in cwds)
+        if not where:
+            return
+        listed = "\n  ".join(dict.fromkeys(where))
+        raise SessionError(
+            f"Account-{account_num} ({email}) is already running in:\n  {listed}\n"
+            f"An account can be live in one place at a time — a second copy "
+            f"logs the first out when either refreshes its token. Exit that "
+            f"session, or give this directory a different account."
+        )
 
     def set_project_account(
         self, cwd: str | Path, identifier: str
@@ -857,8 +977,9 @@ class SessionManager:
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
         self._ensure_not_api_key(account_num, email)
-        self._warn_on_duplicate_holder(
-            project_session_dir(self.switcher.backup_dir, cwd), email, org_uuid
+        self._refuse_if_live_elsewhere(
+            project_session_dir(self.switcher.backup_dir, cwd),
+            account_num, email, org_uuid,
         )
         session_dir, account_num, email = self.setup_session(
             identifier, share=True, project=cwd
@@ -899,40 +1020,6 @@ class SessionManager:
                 "already on it."
             )
         return self.switch_project(cwd, nxt)
-
-    def _warn_on_duplicate_holder(
-        self, session_dir: Path, email: str, org_uuid: str
-    ) -> None:
-        """Warn when another LIVE profile already holds this account.
-
-        Two profiles holding one account each refresh their own copy, and a
-        rotated refresh token invalidates the other's — so the second one to
-        refresh gets logged out. Quiescent profiles are harmless (nothing is
-        refreshing), so only live ones are worth interrupting for.
-        """
-        sessions_root = self.switcher.backup_dir / "sessions"
-        if not sessions_root.is_dir():
-            return
-        for other in sorted(sessions_root.iterdir()):
-            if not other.is_dir() or other == session_dir:
-                continue
-            identity = read_session_identity(other)
-            if identity != (email, org_uuid or ""):
-                continue
-            if profile_is_quiescent(other):
-                continue
-            marker = read_project_marker(other)
-            who = (
-                f"the project profile for {marker['path']}"
-                if marker and marker.get("path")
-                else f"profile {other.name}"
-            )
-            warning(
-                f"{email} is already live in {who}. Two live copies of one "
-                f"account can log each other out when either refreshes its "
-                f"token — prefer a different account for this directory."
-            )
-            return
 
     def exec_default(self, claude_args: list[str]) -> NoReturn:
         """Launch plain Claude Code with the current default login.

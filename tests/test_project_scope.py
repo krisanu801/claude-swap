@@ -683,3 +683,211 @@ class TestDashboardSelectSetsTheDirectory:
         with patch.object(type(app), "_start_action") as start_action:
             app.do_switch("2")
         assert "Switch to account 2" in start_action.call_args[0][0]
+
+
+# ── one account, one live place; and never destroy an uncaptured generation ─
+import os as _os
+
+from claude_swap.session import live_session_cwds, profiles_holding
+
+
+def _make_live(session_dir: Path, cwd: str, pid: int | None = None) -> None:
+    """A live claude under a profile, in ``cwd`` (own PID is always alive)."""
+    pid = pid or _os.getpid()
+    d = session_dir / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{pid}.json").write_text(json.dumps({"pid": pid, "cwd": cwd}))
+
+
+def _rotated(token: str, expires: int) -> str:
+    """A NEWER generation of a family: different refresh token, later expiry."""
+    return json.dumps(
+        {
+            "claudeAiOauth": {
+                "accessToken": f"{token}-rotated",
+                "refreshToken": f"refresh-{token}-rotated",
+                "expiresAt": expires,
+            }
+        }
+    )
+
+
+class TestProfilesHolding:
+    def test_finds_the_account_dir_and_every_project_on_the_account(
+        self, switcher, tmp_path: Path
+    ):
+        potra, hyphenbox, other = (tmp_path / n for n in ("potra", "hyphenbox", "other"))
+        for d in (potra, hyphenbox, other):
+            d.mkdir()
+        _start_profile(switcher, potra, "1", "one@example.com")
+        _start_profile(switcher, hyphenbox, "1", "one@example.com")
+        _start_profile(switcher, other, "2", "two@example.com")
+
+        held = profiles_holding(switcher.backup_dir, "1", "one@example.com", ORG)
+
+        assert project_session_dir(switcher.backup_dir, potra) in held
+        assert project_session_dir(switcher.backup_dir, hyphenbox) in held
+        assert project_session_dir(switcher.backup_dir, other) not in held
+        assert held[0].name == "1-one_example.com", "account dir first"
+
+
+class TestCaptureBeforeDestroy:
+    """The reported bug: switch a directory away from an account whose token
+    rotated inside the profile, then back — and the account is logged out,
+    because the switch away deleted the only fresh copy."""
+
+    def test_switch_away_advances_the_outgoing_backup(self, switcher, project):
+        profile = _start_profile(switcher, project, "1", "one@example.com")
+        # claude refreshed inside the profile: profile is ahead of the backup
+        newer = _rotated("token-1", 9999999999999 + 1)
+        (profile / ".credentials.json").write_text(newer)
+
+        SessionManager(switcher).switch_project(project, "2")
+
+        backup = switcher._read_account_credentials("1", "one@example.com")
+        assert json.loads(backup) == json.loads(newer), (
+            "the rotated generation must reach the backup before the keychain "
+            "entry that held it is deleted"
+        )
+
+    def test_and_switching_back_seeds_the_rotated_generation(
+        self, switcher, project
+    ):
+        profile = _start_profile(switcher, project, "1", "one@example.com")
+        newer = _rotated("token-1", 9999999999999 + 1)
+        (profile / ".credentials.json").write_text(newer)
+        manager = SessionManager(switcher)
+
+        manager.switch_project(project, "2")
+        manager.switch_project(project, "1")
+
+        seeded = json.loads((profile / ".credentials.json").read_text())
+        assert seeded["claudeAiOauth"]["refreshToken"] == "refresh-token-1-rotated"
+
+    def test_an_older_profile_never_regresses_the_backup(self, switcher, project):
+        """A backup that moved on (re-login elsewhere) must not be dragged
+        back to the profile's older generation."""
+        profile = _start_profile(switcher, project, "1", "one@example.com")
+        advanced = _rotated("token-1", 9999999999999 + 5)
+        switcher._store._write_account_credentials("1", "one@example.com", advanced)
+        assert (profile / ".credentials.json").is_file()  # older, still there
+
+        SessionManager(switcher).switch_project(project, "2")
+
+        backup = switcher._read_account_credentials("1", "one@example.com")
+        assert json.loads(backup) == json.loads(advanced)
+
+
+class TestOneLivePlace:
+    def test_refuses_an_account_live_in_another_project(
+        self, switcher, tmp_path: Path
+    ):
+        potra, hyphenbox = tmp_path / "potra", tmp_path / "hyphenbox"
+        potra.mkdir(); hyphenbox.mkdir()
+        other = _start_profile(switcher, hyphenbox, "2", "two@example.com")
+        _make_live(other, str(hyphenbox))
+
+        with pytest.raises(SessionError) as e:
+            SessionManager(switcher).set_project_account(potra, "2")
+
+        assert "hyphenbox" in str(e.value)
+        assert "one place at a time" in str(e.value)
+
+    def test_refuses_the_default_login_while_something_runs_on_it(
+        self, switcher, project, monkeypatch
+    ):
+        from claude_swap import session as session_mod
+
+        monkeypatch.setattr(
+            type(switcher), "_get_current_account",
+            lambda self: ("two@example.com", ORG),
+        )
+        default_dir = session_mod.get_default_global_config_path().parent
+        _make_live(default_dir, "/somewhere/unbound")
+
+        with pytest.raises(SessionError) as e:
+            SessionManager(switcher).set_project_account(project, "2")
+
+        assert "/somewhere/unbound (default login)" in str(e.value)
+
+    def test_the_default_login_is_fine_when_nothing_runs_on_it(
+        self, switcher, project, monkeypatch
+    ):
+        monkeypatch.setattr(
+            type(switcher), "_get_current_account",
+            lambda self: ("two@example.com", ORG),
+        )
+        _, num, _, _ = SessionManager(switcher).set_project_account(project, "2")
+        assert num == "2"
+
+    def test_a_quiescent_profile_elsewhere_is_no_obstacle(
+        self, switcher, tmp_path: Path
+    ):
+        potra, hyphenbox = tmp_path / "potra", tmp_path / "hyphenbox"
+        potra.mkdir(); hyphenbox.mkdir()
+        _start_profile(switcher, hyphenbox, "2", "two@example.com")  # not live
+
+        _, num, _, _ = SessionManager(switcher).set_project_account(potra, "2")
+        assert num == "2"
+
+    def test_the_directory_itself_is_never_its_own_obstacle(
+        self, switcher, project
+    ):
+        profile = _start_profile(switcher, project, "1", "one@example.com")
+        _make_live(profile, str(project))
+        _, num, _ = SessionManager(switcher).switch_project(project, "2")
+        assert num == "2"
+
+
+class TestBackupChangesReachProjectProfiles:
+    """`_post_backup_write` is the chokepoint for 'the backup moved under a
+    profile'. It only ever looked at the account-keyed dir."""
+
+    def test_a_quiescent_project_profile_is_invalidated(self, switcher, project):
+        profile = _start_profile(switcher, project, "1", "one@example.com")
+        assert (profile / ".credentials.json").is_file()
+
+        switcher._write_account_credentials(
+            "1", "one@example.com", _rotated("token-1", 9999999999999 + 1)
+        )
+
+        assert not (profile / ".credentials.json").exists(), (
+            "a superseded project profile must re-bootstrap, not keep serving "
+            "the dead generation"
+        )
+
+    def test_a_live_project_profile_is_marked_stale_not_gutted(
+        self, switcher, project
+    ):
+        from claude_swap.session import is_session_stale
+
+        profile = _start_profile(switcher, project, "1", "one@example.com")
+        _make_live(profile, str(project))
+
+        switcher._write_account_credentials(
+            "1", "one@example.com", _rotated("token-1", 9999999999999 + 1)
+        )
+
+        assert (profile / ".credentials.json").is_file(), "never under a live claude"
+        assert is_session_stale(profile)
+
+
+def test_live_session_cwds_lists_where_an_account_runs(tmp_path: Path):
+    _make_live(tmp_path, "/a"); _make_live(tmp_path, "/b", pid=_os.getpid())
+    assert live_session_cwds(tmp_path) == ["/b"]  # same pid, last record wins
+
+
+def test_reselecting_a_stale_profile_reseeds_it(switcher, project):
+    """The 'already on it' shortcut must not keep a superseded generation."""
+    from claude_swap.session import is_session_stale, mark_session_stale
+
+    profile = _start_profile(switcher, project, "1", "one@example.com")
+    advanced = _rotated("token-1", 9999999999999 + 5)
+    switcher._store._write_account_credentials("1", "one@example.com", advanced)
+    mark_session_stale(profile)
+
+    SessionManager(switcher).switch_project(project, "1")
+
+    seeded = json.loads((profile / ".credentials.json").read_text())
+    assert seeded == json.loads(advanced)
+    assert not is_session_stale(profile)

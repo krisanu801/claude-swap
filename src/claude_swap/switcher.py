@@ -793,18 +793,38 @@ class ClaudeAccountSwitcher:
         worse than the drift caveat — but gets a stale marker so setup_session
         re-bootstraps it once it is no longer live.
         """
-        if self._live_session_pids(account_num, email):
-            from claude_swap.session import mark_session_stale
+        from claude_swap.session import (
+            mark_session_stale,
+            profiles_holding,
+            scan_live_sessions,
+        )
 
-            if not mark_session_stale(self._session_dir(account_num, email)):
-                self._logger.error(
-                    "Account %s's backup credentials changed but its live "
-                    "session profile could not be marked stale; it may keep "
-                    "serving the superseded generation once it exits.",
-                    account_num,
+        org_uuid = (
+            (self._get_sequence_data() or {})
+            .get("accounts", {})
+            .get(str(account_num), {})
+            .get("organizationUuid", "")
+            or ""
+        )
+        # Every profile holding the account, not just the account-keyed one:
+        # a project profile on it is superseded by this write exactly the
+        # same way, and was previously left serving the dead generation.
+        for session_dir in profiles_holding(
+            self.backup_dir, account_num, email, org_uuid
+        ):
+            live, _ = scan_live_sessions(session_dir)
+            if live:
+                if not mark_session_stale(session_dir):
+                    self._logger.error(
+                        "Account %s's backup credentials changed but its live "
+                        "session profile %s could not be marked stale; it may "
+                        "keep serving the superseded generation once it exits.",
+                        account_num, session_dir,
+                    )
+            else:
+                self._invalidate_session_credentials(
+                    account_num, email, session_dir=session_dir
                 )
-        else:
-            self._invalidate_session_credentials(account_num, email)
 
     def _read_account_credentials(self, account_num: str, email: str) -> str:
         return self._store._read_account_credentials(account_num, email)
@@ -2752,7 +2772,9 @@ class ClaudeAccountSwitcher:
                 f"retry {action}."
             )
 
-    def _invalidate_session_credentials(self, account_num: str, email: str) -> None:
+    def _invalidate_session_credentials(
+        self, account_num: str, email: str, session_dir: Path | None = None
+    ) -> None:
         """Drop a session profile's credential material, keeping its history.
 
         The next `cswap run` fails the reuse check and re-bootstraps from
@@ -2765,18 +2787,24 @@ class ClaudeAccountSwitcher:
             delete_macos_keychain_entry,
         )
 
-        session_dir = self._session_dir(account_num, email)
+        if session_dir is None:
+            session_dir = self._session_dir(account_num, email)
         if not session_dir.exists():
             return
         delete_macos_keychain_entry(session_dir)
         (session_dir / ".credentials.json").unlink(missing_ok=True)
         clear_session_stale(session_dir)
         self._logger.info(
-            f"Invalidated session credentials for account {account_num}"
+            f"Invalidated session credentials for account {account_num} "
+            f"at {session_dir.name}"
         )
 
     def _session_profile_ahead(
-        self, account_num: str, email: str, org_uuid: str
+        self,
+        account_num: str,
+        email: str,
+        org_uuid: str,
+        session_dir: Path | None = None,
     ) -> str | None:
         """The session profile's credential when it is a newer generation of
         this slot's family than the stored backup, else None.
@@ -2803,7 +2831,8 @@ class ClaudeAccountSwitcher:
             session_identity_drifted,
         )
 
-        session_dir = self._session_dir(account_num, email)
+        if session_dir is None:
+            session_dir = self._session_dir(account_num, email)
         if is_session_stale(session_dir):
             return None
         profile = read_session_credentials(session_dir)

@@ -176,9 +176,13 @@ Two caveats worth knowing:
   process reads is fixed by `CLAUDE_CONFIG_DIR` at launch, Claude does not read it from
   project settings, and the `claude` binary is a symlink its own installer owns. A Claude
   started without it is on the default login.
-- Pointing two *live* directories at the same account is not free: each refreshes its own
-  copy of the token, and a rotated refresh token invalidates the other's. cswap warns when
-  you do it.
+- **One account, one live place.** A profile holds a copy of the account's refresh token;
+  two live copies each rotate it, and a rotation invalidates the other copy — whichever
+  refreshes second is logged out. So cswap refuses to put an account on a directory while
+  it is running elsewhere (another directory, or the default login), and names where.
+  Exit that session or pick another account. Switching a directory away from an account
+  first captures the token it rotated back into the account's backup, so switching back
+  later lands on a live credential.
 
 <details>
 <summary>Sharing details — MCP servers & chat history</summary>
